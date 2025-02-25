@@ -2,3 +2,6 @@
 /NewsRec/data
 /NewsRec/results
 */nohup.out
+/NewsRec/temp_results
+/.idea
+*.csv

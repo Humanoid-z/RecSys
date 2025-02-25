@@ -1,11 +1,14 @@
-from .PLBaseModel import PLBaseModel
+
 # from deepctr_torch.layers import DNN
+from .PLBaseModel import PLBaseModel
 from deepctr_torch.inputs import SparseFeat, DenseFeat, VarLenSparseFeat
 from deepctr_torch.inputs import get_varlen_pooling_list, varlen_embedding_lookup
 # from ..utils import combined_dnn_input
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
 def combined_dnn_input(sparse_embedding_list, dense_value_list=[]):
     if len(sparse_embedding_list) > 0 and len(dense_value_list) > 0:
         sparse_dnn_input = torch.flatten(
@@ -19,6 +22,8 @@ def combined_dnn_input(sparse_embedding_list, dense_value_list=[]):
         return torch.flatten(torch.cat(dense_value_list, dim=-1), start_dim=1)
     else:
         raise NotImplementedError
+
+
 def activation_layer(act_name, hidden_size=None, dice_dim=2):
     """Construct activation layers
 
@@ -47,30 +52,9 @@ def activation_layer(act_name, hidden_size=None, dice_dim=2):
         raise NotImplementedError
 
     return act_layer
+
+
 class DNN(nn.Module):
-    """The Multi Layer Percetron
-
-      Input shape
-        - nD tensor with shape: ``(batch_size, ..., input_dim)``. The most common situation would be a 2D input with shape ``(batch_size, input_dim)``.
-
-      Output shape
-        - nD tensor with shape: ``(batch_size, ..., hidden_size[-1])``. For instance, for a 2D input with shape ``(batch_size, input_dim)``, the output would have shape ``(batch_size, hidden_size[-1])``.
-
-      Arguments
-        - **inputs_dim**: input feature dimension.
-
-        - **hidden_units**:list of positive integer, the layer number and units in each layer.
-
-        - **activation**: Activation function to use.
-
-        - **l2_reg**: float between 0 and 1. L2 regularizer strength applied to the kernel weights matrix.
-
-        - **dropout_rate**: float in [0,1). Fraction of the units to dropout.
-
-        - **use_bn**: bool. Whether use BatchNormalization before activation or not.
-
-        - **seed**: A Python integer to use as random seed.
-    """
 
     def __init__(self, inputs_dim, hidden_units, activation='relu', l2_reg=0, dropout_rate=0, use_bn=False,
                  init_std=0.0001, dice_dim=3, seed=1024):
@@ -98,7 +82,6 @@ class DNN(nn.Module):
             if 'weight' in name:
                 nn.init.normal_(tensor, mean=0, std=init_std)
 
-
     def forward(self, inputs):
         deep_input = inputs
 
@@ -114,23 +97,29 @@ class DNN(nn.Module):
             fc = self.dropout(fc)
             deep_input = fc
         return deep_input
+
+
 # youtube dnn 的结构没有什么改变
 class YouTubeDNN(PLBaseModel):
     def __init__(self, user_feature_columns, item_feature_columns, dnn_hidden_units=[64, 32],
                  dnn_activation='relu', dnn_use_bn=False,
                  init_std=0.002,
                  l2_reg_dnn=0, l2_reg_embedding=1e-6,
-                 dnn_dropout=0, activation='relu', seed=1024, **kwargs):
+                 dnn_dropout=0, activation='relu', seed=1024,device='cuda', **kwargs):
         super(YouTubeDNN, self).__init__(user_feature_columns, item_feature_columns,
                                          l2_reg_linear=1e-5, l2_reg_embedding=1e-5,
-                                         init_std=0.0001, seed=1024, task='binary', **kwargs)
+                                         init_std=0.0001, seed=1024,device=device, **kwargs)
 
+        self.user_feature_columns = user_feature_columns
+        self.item_feature_columns = item_feature_columns
         self.user_dnn = DNN(self.compute_input_dim(user_feature_columns), dnn_hidden_units,
                             activation=dnn_activation, init_std=init_std)
         self.item_dnn = DNN(self.compute_input_dim(item_feature_columns), dnn_hidden_units,
                             activation=dnn_activation, init_std=init_std)
+        self.to(device)
 
     def forward(self, X):
+
         batch_size = X.size(0)
         user_embedding = self.user_tower(X)
         item_embedding = self.item_tower(X)
@@ -148,17 +137,22 @@ class YouTubeDNN(PLBaseModel):
     def item_tower(self, X):
         if self.mode == "user_representation":
             return None
-
-        item_embedding_list, item_content_embedding_list = self.input_from_item_feature_columns(X, self.item_feature_columns, self.embedding_dict)
+        X = X.to(self.device)
+        item_embedding_list, item_content_embedding_list = self.input_from_item_feature_columns(X,
+                                                                                                self.item_feature_columns,
+                                                                                                self.embedding_dict)
         item_embedding = item_embedding_list[0]  # (batch, movie_list_len, feat_dim)
         if item_content_embedding_list:
-            item_content_embedding_list = [ts.unsqueeze(1).type(item_embedding.type()) for ts in item_content_embedding_list]
-            item_embedding = self.item_dnn(torch.cat([item_embedding, *item_content_embedding_list],dim=-1))
+            item_content_embedding_list = [ts.unsqueeze(1).type(item_embedding.type()) for ts in
+                                           item_content_embedding_list]
+            dnn_input = torch.cat([item_embedding, *item_content_embedding_list], dim=-1)
         else:
-            item_embedding = self.item_dnn(item_embedding)
+            dnn_input = item_embedding
+        item_embedding = self.item_dnn(dnn_input.to(self.device))
         return item_embedding
 
     def user_tower(self, X):
+        X = X.to(self.device)
         if self.mode == "item_representation":
             return None
         # sample softmax 可以通过 构造样本实现
@@ -166,12 +160,12 @@ class YouTubeDNN(PLBaseModel):
             self.input_from_feature_columns(X, self.user_feature_columns, self.embedding_dict)
 
         user_dnn_input = combined_dnn_input(user_sparse_embedding_list, user_dense_value_list)
-        user_embedding = self.user_dnn(user_dnn_input)  # (batch_size, embedding_dim)
+        user_embedding = self.user_dnn(user_dnn_input.to(self.device))  # (batch_size, embedding_dim)
         user_embedding = user_embedding.unsqueeze(1)  # (batch, 1, embedding_dim)
         return user_embedding
 
     def input_from_item_feature_columns(self, X, feature_columns, embedding_dict, support_dense=True):
-    
+
         sparse_feature_columns = list(
             filter(lambda x: isinstance(x, SparseFeat), feature_columns)) if len(feature_columns) else []
         dense_feature_columns = list(
@@ -191,9 +185,9 @@ class YouTubeDNN(PLBaseModel):
         # 这里返回的就是 movie_id 的 embedding
         if varlen_sparse_feature_columns:
             sequence_embed_dict = varlen_embedding_lookup(X, self.embedding_dict, self.feature_index,
-                                                        varlen_sparse_feature_columns)
+                                                          varlen_sparse_feature_columns)
             feat_name = varlen_sparse_feature_columns[0].name
-            item_embedding = sequence_embed_dict[feat_name] 
+            item_embedding = sequence_embed_dict[feat_name]
             # shape is (batch, movie_id_len, feat_dim)
 
             varlen_sparse_embedding_list = [item_embedding]
@@ -203,3 +197,23 @@ class YouTubeDNN(PLBaseModel):
                             dense_feature_columns]
 
         return sparse_embedding_list + varlen_sparse_embedding_list, dense_value_list
+
+    def compute_input_dim(self, feature_columns, include_sparse=True, include_dense=True, feature_group=False):
+        sparse_feature_columns = list(
+            filter(lambda x: isinstance(x, (SparseFeat, VarLenSparseFeat)), feature_columns)) if len(
+            feature_columns) else []
+        dense_feature_columns = list(
+            filter(lambda x: isinstance(x, DenseFeat), feature_columns)) if len(feature_columns) else []
+
+        dense_input_dim = sum(
+            map(lambda x: x.dimension, dense_feature_columns))
+        if feature_group:
+            sparse_input_dim = len(sparse_feature_columns)
+        else:
+            sparse_input_dim = sum(feat.embedding_dim for feat in sparse_feature_columns)
+        input_dim = 0
+        if include_sparse:
+            input_dim += sparse_input_dim
+        if include_dense:
+            input_dim += dense_input_dim
+        return input_dim
